@@ -1,0 +1,12 @@
+[package]
+name = "recshuttle"
+version = "0.1.0"
+edition = "2021"
+description = "SSH transport helpers for remote installer orchestration"
+license = "MIT OR Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0"
