@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "SSH transport helpers for remote installer orchestration"
+description = "SSH transport to a QEMU guest with a forwarded SSH port"
 
 [lib]
 path = "src/lib.rs"
