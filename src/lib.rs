@@ -7,8 +7,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-/// The host address QEMU forwards the guest's SSH port on.
-pub use recqemu::HOSTFWD_ADDRESS as FORWARD_HOST;
+use recqemu::HOSTFWD_ADDRESS;
 
 #[derive(Debug, Clone)]
 pub struct SshExecOutput {
@@ -58,7 +57,7 @@ impl Remote {
             .args(["-o", "StrictHostKeyChecking=no"])
             .args(["-o", "UserKnownHostsFile=/dev/null"])
             .args(["-o", "ConnectTimeout=5"])
-            .arg(format!("root@{FORWARD_HOST}"))
+            .arg(format!("root@{HOSTFWD_ADDRESS}"))
             .arg(remote_cmd)
             .output()
             .with_context(|| format!("running ssh against forwarded guest port {}", self.port))?;
