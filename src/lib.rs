@@ -8,7 +8,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// The host address QEMU forwards the guest's SSH port on.
-pub const FORWARD_HOST: &str = "127.0.0.1";
+pub use recqemu::HOSTFWD_ADDRESS as FORWARD_HOST;
 
 #[derive(Debug, Clone)]
 pub struct SshExecOutput {
