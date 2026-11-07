@@ -56,6 +56,9 @@ impl Remote {
             .args(["-o", "BatchMode=yes"])
             .args(["-o", "StrictHostKeyChecking=no"])
             .args(["-o", "UserKnownHostsFile=/dev/null"])
+            // Without it, ssh's "Permanently added ... to the list of known hosts" on stderr
+            // lands in the output, after a command's JSON.
+            .args(["-o", "LogLevel=ERROR"])
             .args(["-o", "ConnectTimeout=5"])
             .arg(format!("root@{HOSTFWD_ADDRESS}"))
             .arg(remote_cmd)
