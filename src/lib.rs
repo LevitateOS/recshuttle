@@ -8,20 +8,16 @@
 
 use anyhow::{bail, Context, Result};
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use recqemu::HOSTFWD_ADDRESS;
+use recqemu::{Guest, Outcome, HOSTFWD_ADDRESS};
 
-#[derive(Debug, Clone)]
-pub struct SshExecOutput {
-    /// 255 when ssh itself failed (as ssh reports it) or no status was given.
-    pub exit_code: i32,
-    /// stdout followed by stderr.
-    pub output: String,
-}
+/// Longest command one SSH exec carries (an argv entry; Linux allows 128 KiB).
+const MAX_COMMAND_LEN: usize = 100_000;
 
 /// Who logs in to a guest, and with which private key.
 #[derive(Debug, Clone)]
@@ -131,53 +127,32 @@ impl Remote {
         format!("{}@{HOSTFWD_ADDRESS}", self.login.user)
     }
 
-    /// Run `remote_cmd` in the guest's shell.
-    pub fn exec(&self, remote_cmd: &str) -> Result<SshExecOutput> {
-        if !self.login.key.is_file() {
-            bail!("SSH private key not found at '{}'", self.login.key.display());
-        }
-        let output = self
-            .command()
-            .args(["-o", "BatchMode=yes"])
-            .arg(self.destination())
-            .arg(remote_cmd)
-            .output()
-            .with_context(|| format!("running ssh against forwarded guest port {}", self.port))?;
-        let mut merged = String::from_utf8_lossy(&output.stdout).into_owned();
-        merged.push_str(&String::from_utf8_lossy(&output.stderr));
-        Ok(SshExecOutput {
-            exit_code: output.status.code().unwrap_or(255),
-            output: merged,
-        })
-    }
-
-    /// Run `remote_cmd` and return its output, failing unless it exits 0.
-    /// `what` names the step in the error.
-    pub fn run(&self, what: &str, remote_cmd: &str) -> Result<String> {
-        let result = self
-            .exec(remote_cmd)
+    /// Run `remote_cmd` and return its stdout, failing unless it exits 0
+    /// within `budget`. `what` names the step in the error.
+    pub fn run(&mut self, what: &str, remote_cmd: &str, budget: Duration) -> Result<String> {
+        let outcome = self
+            .exec(remote_cmd, budget)
             .with_context(|| format!("{what} (guest port {})", self.port))?;
-        if result.exit_code != 0 {
-            bail!(
-                "{what} failed (exit {}): {}",
-                result.exit_code,
-                result.output.trim()
-            );
+        match outcome {
+            Outcome::Exited { code: 0, output, .. } => Ok(output),
+            Outcome::Exited { code, output, stderr } => {
+                bail!("{what} failed (exit {code}): {}{}", output.trim(), stderr.trim())
+            }
+            Outcome::TimedOut { partial } => {
+                bail!("{what} did not finish within {}s: {}", budget.as_secs(), partial.trim())
+            }
         }
-        Ok(result.output)
     }
 
-    /// Wait until a login runs commands.
-    pub fn wait_ready(&self, timeout: Duration) -> Result<()> {
+    /// Wait until a login runs commands, polling once a second.
+    pub fn wait_ready(&mut self, timeout: Duration) -> Result<()> {
         const MARKER: &str = "__RECSHUTTLE_READY__";
         let started = Instant::now();
         let mut last_err = String::new();
         while started.elapsed() < timeout {
-            match self.exec(&format!("echo {MARKER}")) {
-                Ok(result) if result.exit_code == 0 && result.output.contains(MARKER) => {
-                    return Ok(());
-                }
-                Ok(result) => last_err = result.output,
+            match self.exec(&format!("echo {MARKER}"), Duration::from_secs(15)) {
+                Ok(outcome) if outcome.success() && outcome.output().contains(MARKER) => return Ok(()),
+                Ok(outcome) => last_err = format!("{}: {}", outcome.describe(), outcome.output()),
                 Err(err) => last_err = format!("{err:#}"),
             }
             std::thread::sleep(Duration::from_secs(1));
@@ -204,5 +179,66 @@ impl Remote {
             bail!("the interactive SSH session exited with {status}");
         }
         Ok(())
+    }
+}
+
+impl Guest for Remote {
+    /// Run `command` in the guest's shell over one SSH connection; stdout
+    /// and stderr come back apart. ssh's own failure (exit 255) and a
+    /// signal are errors; a command still running after `budget` is killed
+    /// and reported as timed out.
+    fn exec(&mut self, command: &str, budget: Duration) -> Result<Outcome> {
+        if !self.login.key.is_file() {
+            bail!("SSH private key not found at '{}'", self.login.key.display());
+        }
+        let mut child = self
+            .command()
+            .args(["-o", "BatchMode=yes"])
+            .arg(self.destination())
+            .arg(command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("running ssh against forwarded guest port {}", self.port))?;
+        let reader = |pipe: Option<Box<dyn Read + Send>>| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                if let Some(mut pipe) = pipe {
+                    let mut bytes = Vec::new();
+                    let _ = pipe.read_to_end(&mut bytes);
+                    text = String::from_utf8_lossy(&bytes).into_owned();
+                }
+                text
+            })
+        };
+        let stdout = reader(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+        let stderr = reader(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().context("waiting for ssh")? {
+                break Some(status);
+            }
+            if started.elapsed() >= budget {
+                child.kill().context("stopping ssh after its budget")?;
+                child.wait().context("waiting for the stopped ssh")?;
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let output = stdout.join().unwrap_or_default();
+        let stderr = stderr.join().unwrap_or_default();
+        let Some(status) = status else {
+            return Ok(Outcome::TimedOut { partial: output });
+        };
+        match status.code() {
+            Some(255) => bail!("ssh to guest port {} failed: {}", self.port, stderr.trim()),
+            Some(code) => Ok(Outcome::Exited { code, output, stderr }),
+            None => bail!("ssh to guest port {} was killed by a signal ({status})", self.port),
+        }
+    }
+
+    fn max_command_len(&self) -> usize {
+        MAX_COMMAND_LEN
     }
 }
