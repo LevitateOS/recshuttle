@@ -11,5 +11,5 @@ description = "SSH transport to a QEMU guest with a forwarded SSH port"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = "1.0"
+anyhow = { workspace = true }
 recqemu = { path = "../recqemu" }
