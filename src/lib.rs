@@ -123,6 +123,16 @@ impl Remote {
         ssh
     }
 
+    /// A command on an actual guest PTY, using this connection's identity.
+    /// The caller owns stdin, output retention and process lifetime.
+    pub fn terminal_command(&self, command: &str) -> Command {
+        let mut ssh = self.command();
+        ssh.args(["-tt", "-o", "BatchMode=yes"])
+            .arg(self.destination())
+            .arg(command);
+        ssh
+    }
+
     fn destination(&self) -> String {
         format!("{}@{HOSTFWD_ADDRESS}", self.login.user)
     }
